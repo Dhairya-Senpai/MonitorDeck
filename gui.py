@@ -28,7 +28,10 @@ SLIDER_DEBOUNCE_MS = 250
 """How long a slider must sit still before the value is written."""
 
 CONFIRM_CODES = (0x60, 0xD6)
-"""Codes that must never be applied without an explicit confirmation."""
+"""Standard codes that must never be applied without an explicit confirmation.
+
+Vendor codes always require confirmation as well; see MainWindow._needs_confirmation.
+"""
 
 
 class DDCWorker(QObject):
@@ -84,11 +87,16 @@ class DDCWorker(QObject):
         finally:
             self.busy.emit(False, "")
 
-    @Slot(object, int, int)
-    def write(self, monitor: ddc.Monitor, code: int, value: int) -> None:
-        """Write a known VCP code, clamped by the monitor's own maximum."""
+    @Slot(object, int, int, bool)
+    def write(self, monitor: ddc.Monitor, code: int, value: int,
+              confirmed: bool) -> None:
+        """Write a VCP code, clamped by the monitor's own maximum.
+
+        Vendor codes reach ddc only when the UI confirmed them.
+        """
         try:
-            monitor.write_vcp(code, value, known=caps_mod.is_known_code(code))
+            monitor.write_vcp(code, value, confirmed=confirmed,
+                              known=caps_mod.is_known_code(code))
             self.value_written.emit(code, value)
         except Exception as error:
             log.error("write 0x%02X = %d failed: %s", code, value, error)
@@ -174,20 +182,21 @@ class SliderControl(QWidget):
 class ChoiceControl(QWidget):
     """Drop-down plus Apply button for a discrete VCP code.
 
-    Codes in CONFIRM_CODES (input source, power) ask before applying, so no
-    input switch or power change can happen by accident.
+    Applying never happens on selection alone; the window decides whether the
+    change also needs a confirmation dialog.
     """
 
     value_set = Signal(int, int)
 
     def __init__(self, code: int, name: str, allowed: list[int],
-                 current: Optional[int]) -> None:
+                 current: Optional[int],
+                 labeller=None) -> None:
         super().__init__()
         self.code = code
         self._name = name
         self._combo = QComboBox()
         for value in allowed:
-            label = caps_mod.value_name(code, value) or f"0x{value:02X}"
+            label = (labeller(value) if labeller else None) or f"0x{value:02X}"
             self._combo.addItem(label, value)
         if current is not None:
             index = self._combo.findData(current)
@@ -212,28 +221,24 @@ class ChoiceControl(QWidget):
 
     def _on_apply(self) -> None:
         value = self._combo.currentData()
-        if value is None:
-            return
-        if self.code in CONFIRM_CODES and not self._confirm(value):
-            return
-        self.value_set.emit(self.code, int(value))
-
-    def _confirm(self, value: int) -> bool:
-        label = caps_mod.value_name(self.code, value) or f"0x{value:02X}"
-        answer = QMessageBox.question(
-            self, "Confirm", f"Set {self._name} to {label}?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        return answer == QMessageBox.StandardButton.Yes
+        if value is not None:
+            self.value_set.emit(self.code, int(value))
 
 
 def build_control(row: caps_mod.ScanRow) -> Optional[QWidget]:
-    """Create the right widget for one scanned code, or None if not usable."""
+    """Create the right widget for one scanned code, or None if not usable.
+
+    Discrete codes offer only the values the monitor actually accepts, so
+    values it publishes but ignores never appear in the drop-down.
+    """
     if row.current is None or row.maximum is None or row.read_only:
         return None
+    usable = row.usable if row.usable is not None else row.allowed
+    if usable:
+        return ChoiceControl(row.code, row.name, usable, row.current,
+                             labeller=row.label_for)
     if row.allowed:
-        return ChoiceControl(row.code, row.name, row.allowed, row.current)
+        return None
     return SliderControl(row.code, row.name, row.maximum, row.current)
 
 
@@ -274,7 +279,7 @@ class MainWindow(QMainWindow):
 
     scan_requested = Signal(object)
     refresh_requested = Signal()
-    write_requested = Signal(object, int, int)
+    write_requested = Signal(object, int, int, bool)
     shutdown_requested = Signal()
 
     def __init__(self) -> None:
@@ -283,6 +288,8 @@ class MainWindow(QMainWindow):
         self.resize(1080, 720)
         self._monitors: list[ddc.Monitor] = []
         self._controls: dict[int, QWidget] = {}
+        self._rows: dict[int, caps_mod.ScanRow] = {}
+        self._applied: dict[int, int] = {}
 
         self._thread = QThread(self)
         self._worker = DDCWorker()
@@ -451,18 +458,15 @@ class MainWindow(QMainWindow):
         self._model_label.setText(
             f"{caps.model or monitor.description}  -  {caps.monitor_type or '?'}, "
             f"MCCS {caps.mccs_version or '?'}, {len(caps.features)} codes")
+        self._rows = {row.code: row for row in rows}
         self._fill_table(rows)
-        self._build_controls(rows)
+        self._build_controls(caps, rows)
 
     def _fill_table(self, rows: list[caps_mod.ScanRow]) -> None:
         """Write the scan rows into the capability table."""
         self._table.setRowCount(len(rows))
         for index, row in enumerate(rows):
-            values = " ".join(
-                f"{v:02X}={caps_mod.value_name(row.code, v)}"
-                if caps_mod.value_name(row.code, v) else f"{v:02X}"
-                for v in (row.allowed or [])
-            )
+            values = row.values_label()
             cells = [f"0x{row.code:02X}", row.name, row.current_label,
                      "-" if row.maximum is None else str(row.maximum),
                      row.access, values]
@@ -470,25 +474,32 @@ class MainWindow(QMainWindow):
                 self._table.setItem(index, column, QTableWidgetItem(cell))
         self._table.resizeColumnsToContents()
 
-    def _build_controls(self, rows: list[caps_mod.ScanRow]) -> None:
-        """Create a control for every supported standard code."""
+    def _build_controls(self, caps: caps_mod.Capabilities,
+                        rows: list[caps_mod.ScanRow]) -> None:
+        """Create a control for every supported standard and identified code."""
         self._clear_controls()
+        self._applied.clear()
         by_code = {row.code: row for row in rows}
         for code in caps_mod.STANDARD_CONTROLS:
-            row = by_code.get(code)
-            if row is None:
+            if code not in caps.features:
                 log.info("%s (0x%02X) not published by this monitor - hidden",
-                         caps_mod.code_name(code), code)
-                continue
-            widget = build_control(row)
+                         caps_mod.code_name(code, caps.vendor), code)
+        for code in caps.control_codes():
+            row = by_code.get(code)
+            widget = build_control(row) if row else None
             if widget is None:
                 continue
             widget.value_set.connect(self._on_control_changed)
             self._controls_form.addRow(f"{row.name}", widget)
             self._controls[code] = widget
+            if row.current is not None:
+                self._applied[code] = row.current
+        standard = sum(1 for c in self._controls if caps_mod.is_known_code(c))
+        vendor = len(self._controls) - standard
         self._controls_hint.setText(
-            f"{len(self._controls)} of {len(caps_mod.STANDARD_CONTROLS)} standard "
-            f"controls supported by this monitor.")
+            f"{standard} of {len(caps_mod.STANDARD_CONTROLS)} standard controls"
+            + (f", plus {vendor} identified vendor control(s)." if vendor
+               else " supported by this monitor."))
 
     def _clear_controls(self) -> None:
         """Remove every control widget from the form."""
@@ -502,15 +513,52 @@ class MainWindow(QMainWindow):
 
     @Slot(int, int)
     def _on_control_changed(self, code: int, value: int) -> None:
-        """Send a control change to the worker."""
+        """Confirm if needed, then send the change to the worker."""
         monitor = self._current_monitor()
-        if monitor is not None:
-            self.write_requested.emit(monitor, code, value)
+        if monitor is None:
+            return
+        confirmed = False
+        if self._needs_confirmation(code):
+            if not self._confirm(code, value):
+                self._revert(code)
+                return
+            confirmed = True
+        self.write_requested.emit(monitor, code, value, confirmed)
+
+    def _needs_confirmation(self, code: int) -> bool:
+        """Input, power and every vendor-specific code must be confirmed."""
+        return code in CONFIRM_CODES or not caps_mod.is_known_code(code)
+
+    def _confirm(self, code: int, value: int) -> bool:
+        """Ask before applying one change, naming the code and the value."""
+        row = self._rows.get(code)
+        name = row.name if row else caps_mod.code_name(code)
+        label = (row.label_for(value) if row else None) or str(value)
+        extra = ("\n\nThis is a manufacturer-specific code. Its current value "
+                 "will be remembered so you can set it back."
+                 if not caps_mod.is_known_code(code) else "")
+        answer = QMessageBox.question(
+            self, "Confirm change",
+            f"Set {name} (0x{code:02X}) to {label}?{extra}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _revert(self, code: int) -> None:
+        """Put a control back to the last applied value after a declined change."""
+        widget = self._controls.get(code)
+        previous = self._applied.get(code)
+        if widget is not None and previous is not None:
+            widget.set_value(previous)
 
     @Slot(int, int)
     def _on_value_written(self, code: int, value: int) -> None:
-        self.statusBar().showMessage(
-            f"{caps_mod.code_name(code)} set to {value}", 4000)
+        self._applied[code] = value
+        row = self._rows.get(code)
+        name = row.name if row else caps_mod.code_name(code)
+        label = (row.label_for(value) if row else None) or str(value)
+        self.statusBar().showMessage(f"{name} set to {label}", 4000)
 
     @Slot(str)
     def _on_failed(self, message: str) -> None:

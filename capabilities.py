@@ -115,9 +115,41 @@ STANDARD_CONTROLS: tuple[int, ...] = (
 )
 """Codes MonitorDeck offers controls for, if the monitor supports them."""
 
+VENDOR_CODE_NAMES: dict[str, dict[int, str]] = {
+    "ACER": {0xE2: "Picture mode (eColor)"},
+}
+"""Vendor codes identified by supervised probing, keyed by model prefix.
 
-def code_name(code: int) -> str:
-    """Return a readable name for a VCP code."""
+Vendor codes mean different things on different monitors, so a name only
+applies to the manufacturer it was identified on.
+"""
+
+VENDOR_VALUE_NAMES: dict[str, dict[int, dict[int, str]]] = {
+    "ACER": {
+        0xE2: {0x00: "Standard", 0x01: "ECO", 0x02: "Graphics", 0x03: "User"},
+    },
+}
+"""Values confirmed to work, per vendor code.
+
+The capability string of the XV270U also publishes 0x04, 0x09, 0x0C and 0x0D
+for 0xE2, but the monitor silently ignores writes of those, so they are left
+out and controls offer only the values listed here.
+"""
+
+
+def vendor_key(model: Optional[str]) -> Optional[str]:
+    """Map a capability-string model to a key in the vendor tables."""
+    if not model:
+        return None
+    first = model.strip().split()[0].upper()
+    return first if first in VENDOR_CODE_NAMES else None
+
+
+def code_name(code: int, vendor: Optional[str] = None) -> str:
+    """Return a readable name for a VCP code, preferring an identified one."""
+    identified = VENDOR_CODE_NAMES.get(vendor or "", {}).get(code)
+    if identified:
+        return identified
     if code in VCP_NAMES:
         return VCP_NAMES[code]
     if 0xE0 <= code <= 0xFF:
@@ -125,9 +157,11 @@ def code_name(code: int) -> str:
     return f"Unknown (0x{code:02X})"
 
 
-def value_name(code: int, value: int) -> Optional[str]:
+def value_name(code: int, value: int,
+               vendor: Optional[str] = None) -> Optional[str]:
     """Return a readable name for one discrete value, if known."""
-    return VALUE_NAMES.get(code, {}).get(value)
+    identified = VENDOR_VALUE_NAMES.get(vendor or "", {}).get(code, {}).get(value)
+    return identified or VALUE_NAMES.get(code, {}).get(value)
 
 
 def is_known_code(code: int) -> bool:
@@ -141,11 +175,25 @@ class VCPFeature:
 
     code: int
     allowed: Optional[list[int]] = None
+    vendor: Optional[str] = None
 
     @property
     def name(self) -> str:
         """Readable name of the code."""
-        return code_name(self.code)
+        return code_name(self.code, self.vendor)
+
+    @property
+    def usable_values(self) -> Optional[list[int]]:
+        """Published values, minus any this monitor is known to ignore."""
+        identified = VENDOR_VALUE_NAMES.get(self.vendor or "", {}).get(self.code)
+        if identified is None:
+            return self.allowed
+        return [value for value in self.allowed or [] if value in identified]
+
+    @property
+    def is_identified_vendor_code(self) -> bool:
+        """True for a vendor code whose meaning we confirmed on this model."""
+        return self.code in VENDOR_CODE_NAMES.get(self.vendor or "", {})
 
     @property
     def is_continuous(self) -> bool:
@@ -171,9 +219,22 @@ class Capabilities:
     features: dict[int, VCPFeature] = field(default_factory=dict)
     extras: dict[str, str] = field(default_factory=dict)
 
+    @property
+    def vendor(self) -> Optional[str]:
+        """Vendor table key for this model, or None if we have no data for it."""
+        return vendor_key(self.model)
+
     def supports(self, code: int) -> bool:
         """True when the monitor publishes this VCP code."""
         return code in self.features
+
+    def control_codes(self) -> list[int]:
+        """Codes to build controls for: supported standard ones, then
+        identified vendor ones."""
+        codes = [c for c in STANDARD_CONTROLS if c in self.features]
+        codes += [c for c, f in sorted(self.features.items())
+                  if f.is_identified_vendor_code]
+        return codes
 
     def standard_controls(self) -> list[VCPFeature]:
         """The STANDARD_CONTROLS codes this monitor actually publishes."""
@@ -292,6 +353,9 @@ def parse_capabilities(raw: str) -> Capabilities:
             caps.mccs_version = value.strip()
         else:
             caps.extras[key] = value.strip()
+
+    for feature in caps.features.values():
+        feature.vendor = caps.vendor
     return caps
 
 
@@ -306,6 +370,8 @@ class ScanRow:
     read_only: bool
     continuous: bool
     allowed: Optional[list[int]]
+    usable: Optional[list[int]] = None
+    vendor: Optional[str] = None
     error: Optional[str] = None
 
     @property
@@ -318,8 +384,23 @@ class ScanRow:
         """Current value, with the discrete value's name when one is known."""
         if self.current is None:
             return self.error or "no reply"
-        named = value_name(self.code, self.current)
+        named = self.label_for(self.current)
         return f"{self.current} ({named})" if named else str(self.current)
+
+    def label_for(self, value: int) -> Optional[str]:
+        """Readable name for one of this code's values, if known."""
+        return value_name(self.code, value, self.vendor)
+
+    def values_label(self) -> str:
+        """The published values as text, marking ones the monitor ignores."""
+        parts = []
+        for value in self.allowed or []:
+            named = self.label_for(value)
+            text = f"{value:02X}={named}" if named else f"{value:02X}"
+            if self.usable is not None and value not in self.usable:
+                text += "(ignored)"
+            parts.append(text)
+        return " ".join(parts)
 
 
 def scan_monitor(monitor: Monitor, caps: Capabilities,
@@ -327,7 +408,7 @@ def scan_monitor(monitor: Monitor, caps: Capabilities,
     """Read the current value of every published code. Read-only, never writes."""
     rows: list[ScanRow] = []
     for code in sorted(codes if codes is not None else caps.features):
-        feature = caps.features.get(code, VCPFeature(code))
+        feature = caps.features.get(code, VCPFeature(code, vendor=caps.vendor))
         reading = monitor.read_vcp(code)
         rows.append(ScanRow(
             code=code,
@@ -337,6 +418,8 @@ def scan_monitor(monitor: Monitor, caps: Capabilities,
             read_only=feature.read_only,
             continuous=feature.is_continuous,
             allowed=feature.allowed,
+            usable=feature.usable_values,
+            vendor=feature.vendor,
             error=None if reading else "no reply",
         ))
     return rows
@@ -347,13 +430,7 @@ def format_scan_table(rows: list[ScanRow]) -> str:
     header = f"{'Code':<6}{'Name':<34}{'Current':<18}{'Max':<7}{'Access':<8}Values"
     lines = [header, "-" * len(header)]
     for row in rows:
-        allowed = ""
-        if row.allowed:
-            parts = []
-            for value in row.allowed:
-                named = value_name(row.code, value)
-                parts.append(f"{value:02X}={named}" if named else f"{value:02X}")
-            allowed = " ".join(parts)
+        allowed = row.values_label()
         maximum = "-" if row.maximum is None else str(row.maximum)
         lines.append(f"0x{row.code:02X}  {row.name:<34}{row.current_label:<18}"
                      f"{maximum:<7}{row.access:<8}{allowed}")
